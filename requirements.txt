@@ -1,0 +1,4 @@
+# Only needed to run the direct-mode test suite (tests/direct/). Deployment
+# itself is done with the `genlayer` CLI (Node/npm), not Python - see README.
+genlayer-test>=0.29.2
+pytest>=8.0
