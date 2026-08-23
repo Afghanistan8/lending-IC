@@ -52,6 +52,14 @@ This contract avoids the problem architecturally. On first use, `LendingProtocol
 
 `borrow()` pays out directly from the protocol's own liquidity balance to the borrower's wallet; that leg needs no attribution, since the contract itself chooses the recipient.
 
+### Vault debt-token reservation
+
+`fund()` and `repay()` both read a vault's *live* debt-token balance to decide what they may credit, then instruct the vault to forward that amount out via `Vault.forward()` — an **asynchronous** message. The vault's balance does not actually drop until that forward lands, which can be well after the call that emitted it returns. Without protection, calling `fund()`/`repay()` again for the **same vault** before the first forward settles would see the identical, not-yet-decremented balance and get credited a second time for tokens that are already committed elsewhere.
+
+`vault_debt_reserved[vault]` tracks exactly how much of a vault's balance is already spoken for by an outstanding forward. `fund()`/`repay()` only ever credit the balance **above** that reservation (`_reconcile_vault_debt()`), and the reservation is shared between the two functions since both draw on, and forward out of, the same vault balance. Once an earlier forward actually lands, the very next `fund()`/`repay()` call self-heals the reservation down to match reality before computing what's newly available; `reconcile_vault_debt(vault)` is also exposed as a standalone permissionless call, for the narrow case where a genuine new deposit lands in the same window and happens not to push the balance strictly above a still-stale reservation.
+
+`supply()` needs no equivalent: it never moves tokens *out* of a vault (collateral just sits there until `withdraw()`/`liquidate()`), so there is no async gap for a repeated call to race.
+
 ## Liquidation
 
 Liquidation is a **multi-step saga**, not a single transaction, because GenLayer cross-contract writes are asynchronous messages with no ordering guarantee between two messages emitted from the same call.
@@ -86,9 +94,11 @@ A stalled swap is retried automatically by calling `advance_liquidation()` again
 | `register()` | write | deploys the caller's personal vault; idempotent; also auto-called by `supply`/`fund`/`repay` |
 | `get_vault_of(user)` / `predict_vault_of(user)` | view | the user's vault address, registered or predicted |
 | `supply(amount)` | write | credits collateral from the caller's vault |
-| `fund(amount)` | write | adds lendable liquidity from the caller's vault |
+| `fund(amount)` | write | adds lendable liquidity from the caller's vault, net of any still-unsettled reservation |
 | `borrow(amount)` | write | **requires a ruling**; pays out to the caller's wallet |
-| `repay(amount)` | write | reduces debt from the caller's vault |
+| `repay(amount)` | write | reduces debt from the caller's vault, net of any still-unsettled reservation |
+| `get_vault_debt_reserved(vault)` | view | debt-asset amount already committed to an outstanding, not-yet-landed `fund()`/`repay()` forward |
+| `reconcile_vault_debt(vault)` | write | permissionless; trues up a vault's reservation against its current balance |
 | `withdraw(amount)` | write | returns collateral from the caller's vault to their wallet |
 | `liquidate(user)` | write | **requires a ruling**; permissionless; starts the liquidation saga |
 | `advance_liquidation(liq_id)` | write | permissionless driver; call until it returns the repaid amount |
@@ -169,6 +179,7 @@ Coverage:
 - **Concurrent multi-user activity** — interleaved supply/fund/borrow/repay across several users stays correctly attributed
 - **Liquidation proceeds isolation** — an unrelated transfer landing during a liquidation's swap window is not counted as proceeds, and a concurrent third-party swap on the same pool cannot inflate what's credited
 - **In-flight payout isolation** — an unsettled borrow payout sitting on the lending contract's own balance cannot be mistaken for another user's deposit
+- **Vault debt-token reservation** — repeated `fund()`/`repay()` calls on the same vault before an earlier forward has settled cannot double-count the same balance, whether racing against themselves or against each other
 
 ## Scope
 

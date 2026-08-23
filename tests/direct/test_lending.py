@@ -574,6 +574,11 @@ def test_concurrent_multi_user_activity_stays_attributed():
 
         # Alice repays via her vault while Bob is also moving tokens around
         # in the same window; Alice's repay is attributed only to Alice.
+        # Her earlier fund(100)'s forward already landed (ledger.settle()
+        # above), but her reservation for it hasn't self-healed yet - true
+        # it up explicitly before crediting a same-vault deposit that would
+        # otherwise coincidentally mask the stale reservation.
+        contract.reconcile_vault_debt(alice_vault)
         ledger.debit(tusdc, alice, 100)
         ledger.credit(tusdc, alice_vault, 100)
         ledger.credit(tusdc, bob_vault, 50)  # Bob funds his vault too, but has no debt
@@ -733,3 +738,160 @@ def test_borrow_payout_in_flight_does_not_confuse_supply():
         ledger.credit(tgen, bob_vault, 100)
         contract.supply(100)
         assert int(contract.get_collateral(bob)) == 100
+
+
+# ======================================================================
+# VAULT DEBT-TOKEN RESERVATION - repeated fund()/repay() before the
+# forward settles must not double-count the same balance
+# ======================================================================
+#
+# fund()/repay() read a vault's LIVE debt-token balance, then instruct the
+# vault to forward that amount out. The forward is async: the vault's
+# balance does not actually drop until it lands. Without reservation
+# accounting, calling fund()/repay() again on the SAME vault before that
+# happens would see the identical (not-yet-decremented) balance and get
+# credited a second time for tokens that are already committed to the
+# first call's forward.
+
+
+def test_repeated_fund_before_forward_settles_does_not_double_count():
+    """The exact scenario: a vault holds 100 tUSDC. fund(100) is called
+    twice back-to-back, before the first call's forward has landed. Only
+    the FIRST call may succeed; the second must see zero available balance
+    and fail cleanly - tracked_liquidity must reflect real tokens, not
+    double the vault's actual balance."""
+    vm = VMContext()
+    env = _lending_env(vm)
+    contract, ledger, tusdc = env["contract"], env["ledger"], env["tusdc"]
+
+    with vm.activate():
+        funder = create_address("funder")
+        vm.sender = funder
+        vault = contract.register()
+        ledger.credit(tusdc, vault, 100)
+
+        # First fund() succeeds and reserves the vault's entire balance -
+        # its forward is emitted but NOT settled yet.
+        contract.fund(100)
+        assert int(contract.get_tracked_liquidity()) == 100
+        assert int(contract.get_vault_debt_reserved(vault)) == 100
+
+        # ATTACK-shaped case: fund() again immediately, before the first
+        # forward has landed. The vault's OBSERVED balance is still 100
+        # (unchanged - nothing has actually left it yet), but all 100 of
+        # it is already reserved by the first call.
+        with pytest.raises(AssertionError, match="not enough tUSDC in your vault"):
+            contract.fund(1)
+        assert int(contract.get_tracked_liquidity()) == 100, "must not be double-counted"
+
+        # Once the first forward genuinely lands, funding again with a
+        # REAL additional transfer works normally.
+        ledger.settle()
+        contract.reconcile_vault_debt(vault)
+        assert int(contract.get_vault_debt_reserved(vault)) == 0
+        ledger.credit(tusdc, vault, 50)
+        contract.fund(50)
+        assert int(contract.get_tracked_liquidity()) == 150
+
+
+def test_repeated_repay_before_forward_settles_does_not_double_count_debt():
+    """Same race on repay(): a borrower's vault holds exactly enough tUSDC
+    to repay once. Calling repay() twice back-to-back, before the first
+    forward lands, must not reduce debt twice from the same tokens."""
+    vm = VMContext()
+    env = _lending_env(vm, rate=2)
+    contract, ledger, tgen, tusdc = env["contract"], env["ledger"], env["tgen"], env["tusdc"]
+
+    with vm.activate():
+        env["assess"]()
+        alice = create_address("alice")
+        vm.sender = alice
+        alice_vault = contract.register()
+        ledger.credit(tgen, alice_vault, 1000)
+        contract.supply(1000)
+
+        vm.sender = env["owner"]
+        owner_vault = contract.register()
+        ledger.credit(tusdc, owner_vault, 5000)
+        contract.fund(5000)
+        ledger.settle()
+        contract.reconcile_vault_debt(owner_vault)
+
+        vm.sender = alice
+        contract.borrow(1000)
+        ledger.settle()
+        assert int(contract.get_debt(alice)) == 1000
+
+        # Alice's vault holds exactly 200 tUSDC - enough for ONE repay(200).
+        ledger.credit(tusdc, alice_vault, 200)
+        contract.repay(200)
+        assert int(contract.get_debt(alice)) == 800
+        assert int(contract.get_vault_debt_reserved(alice_vault)) == 200
+
+        # ATTACK-shaped case: repay() again immediately for the SAME 200,
+        # before the first forward has landed. Her vault's observed balance
+        # is still 200 (nothing has actually left yet), and all of it is
+        # already reserved.
+        with pytest.raises(AssertionError, match="not enough tUSDC in your vault"):
+            contract.repay(200)
+        assert int(contract.get_debt(alice)) == 800, "must not be credited twice"
+
+        # Once the first forward lands and she sends a REAL second payment,
+        # repay works normally again.
+        ledger.settle()
+        contract.reconcile_vault_debt(alice_vault)
+        ledger.credit(tusdc, alice_vault, 100)
+        contract.repay(100)
+        assert int(contract.get_debt(alice)) == 700
+
+
+def test_fund_and_repay_share_the_same_vault_reservation():
+    """fund() and repay() both draw on, and forward out of, the SAME
+    vault's debt-token balance. A fund() call and a repay() call racing on
+    the same still-unsettled balance must not be able to double-credit it
+    between the two different entry points either."""
+    vm = VMContext()
+    env = _lending_env(vm, rate=2)
+    contract, ledger, tgen, tusdc = env["contract"], env["ledger"], env["tgen"], env["tusdc"]
+
+    with vm.activate():
+        env["assess"]()
+        alice = create_address("alice")
+        vm.sender = alice
+        alice_vault = contract.register()
+        ledger.credit(tgen, alice_vault, 1000)
+        contract.supply(1000)
+
+        vm.sender = env["owner"]
+        owner_vault = contract.register()
+        ledger.credit(tusdc, owner_vault, 5000)
+        contract.fund(5000)
+        ledger.settle()
+        contract.reconcile_vault_debt(owner_vault)
+
+        vm.sender = alice
+        contract.borrow(1000)
+        ledger.settle()
+
+        # Alice's vault holds exactly 300 tUSDC.
+        ledger.credit(tusdc, alice_vault, 300)
+
+        # She calls repay(300) - reserves the full 300, forward not landed
+        # yet. repay() legitimately adds the repaid amount back to
+        # tracked_liquidity too (same as fund() would), so this is the one
+        # and only credit this 300 may ever produce.
+        contract.repay(300)
+        assert int(contract.get_debt(alice)) == 700
+        assert int(contract.get_vault_debt_reserved(alice_vault)) == 300
+        liquidity_after_repay = int(contract.get_tracked_liquidity())
+        assert liquidity_after_repay == 5000 - 1000 + 300
+
+        # She (or anyone driving her wallet) then also tries fund(300) on
+        # the SAME vault balance, hoping the reservation only applies
+        # per-function. It doesn't - the reservation is per-vault, shared
+        # across fund() and repay().
+        with pytest.raises(AssertionError, match="not enough tUSDC in your vault"):
+            contract.fund(300)
+        assert int(contract.get_tracked_liquidity()) == liquidity_after_repay, (
+            "must not be credited a second time via fund()"
+        )

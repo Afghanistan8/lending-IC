@@ -65,6 +65,20 @@ CUSTODY MODEL - per-user vaults, not a shared deposit address
   borrower's wallet - the outbound leg needs no attribution, since the
   contract itself chooses the recipient.
 
+  A vault's balance is read LIVE, and that read can race the vault's own
+  outbound forwards: fund()/repay() instruct a vault to forward tokens
+  out, but that forward is an asynchronous message, so the vault's balance
+  does not actually drop until it lands - which can be well after the call
+  that emitted it returns. A second fund()/repay() call for the SAME vault,
+  issued before the first forward settles, would otherwise see the exact
+  same (not-yet-decremented) balance and get credited again for tokens
+  that are already spoken for. vault_debt_reserved tracks exactly how much
+  of a vault's balance is already committed to a forward that has not yet
+  been confirmed gone, and fund()/repay() only ever credit the balance
+  ABOVE that reservation - see _reconcile_vault_debt(). supply() needs no
+  equivalent: it never moves tokens out of a vault, so there is no async
+  gap for a repeated call to race.
+
 EVERYTHING ELSE
   - collateral is tGEN, debt is tUSDC; collateral is priced by a live
     cross-contract view() quote from a trusted external AMM pool
@@ -211,6 +225,17 @@ class LendingProtocol(gl.Contract):
     # vaults[user] = the CREATE2 address of that user's personal token
     # escrow. See the module docstring's CUSTODY MODEL section.
     vaults: TreeMap[Address, Address]
+    # vault_debt_reserved[vault] = debt-asset amount already counted toward
+    # tracked_liquidity/debt reduction by a fund()/repay() call whose
+    # Vault.forward() has been emitted but not yet confirmed to have left
+    # the vault. fund()/repay() read the vault's LIVE balance to decide what
+    # they may credit; that balance does not actually drop until the async
+    # forward from an EARLIER call lands. Without this counter, a second
+    # fund()/repay() call issued before the first forward settles would see
+    # the same (not-yet-decremented) balance and get credited again for
+    # tokens that are already spoken for - see
+    # _reconcile_vault_debt()/_reserve_vault_debt() below.
+    vault_debt_reserved: TreeMap[Address, u256]
     # ---- liquidation saga ----
     next_liq_id: u256
     liq_pending: bool
@@ -513,6 +538,68 @@ class LendingProtocol(gl.Contract):
         exist yet, and return its address. Idempotent."""
         return self._ensure_vault(gl.message.sender_address)
 
+    # ---------------- vault debt-token reservation accounting ----------------
+    # fund()/repay() both read a vault's LIVE debt-token balance to decide
+    # what they may credit, then instruct the vault to forward that amount
+    # out. The forward is an ASYNC message: the vault's balance does not
+    # actually drop until it lands, which can be well after fund()/repay()
+    # returns. If a second fund()/repay() call for the SAME vault runs
+    # before the first forward settles, a naive balance check sees the
+    # exact same (not-yet-decremented) balance and credits it again -
+    # crediting more liquidity or debt reduction than tokens that will ever
+    # actually arrive.
+    #
+    # This is fixed the same way an outgoing payout in flight is kept from
+    # being double-spent elsewhere in this contract: track how much of the
+    # observed balance is already SPOKEN FOR by an outstanding forward
+    # (vault_debt_reserved), and only ever credit the balance ABOVE that
+    # reservation. Once the earlier forward actually lands, the vault's
+    # balance drops below the reservation floor, and the very next
+    # fund()/repay() call self-heals the reservation down to match reality
+    # before computing what's newly available.
+    def _reconcile_vault_debt(self, vault: Address) -> u256:
+        balance = gl.get_contract_at(self.debt_token).view().balance_of(vault)
+        reserved = self.vault_debt_reserved.get(vault, u256(0))
+        if balance <= reserved:
+            # Some (or all) of the reserved amount has already left the
+            # vault - shrink the reservation by exactly the observed
+            # shortfall so it never drifts above what could still be
+            # outstanding.
+            shortfall = reserved - balance
+            settled = shortfall if shortfall <= reserved else reserved
+            self.vault_debt_reserved[vault] = reserved - settled
+            return u256(0)
+        return balance - reserved
+
+    def _reserve_vault_debt(self, vault: Address, amount: u256) -> None:
+        self.vault_debt_reserved[vault] = self.vault_debt_reserved.get(vault, u256(0)) + amount
+
+    @gl.public.view
+    def get_vault_debt_reserved(self, vault: Address) -> u256:
+        """Debt-asset amount already credited from this vault by a
+        fund()/repay() call whose forward has not yet been confirmed to
+        have left. Excluded from what a subsequent fund()/repay() call may
+        credit."""
+        return self.vault_debt_reserved.get(vault, u256(0))
+
+    @gl.public.write
+    def reconcile_vault_debt(self, vault: Address) -> u256:
+        """Permissionless: true up a vault's debt-token reservation against
+        its current balance, in case an earlier forward has since landed.
+        Always succeeds and never credits anyone - it only ever shrinks the
+        reservation.
+
+        Calling this is only needed in one narrow case: a genuine new
+        deposit to the SAME vault happens to land in the same window that
+        an earlier fund()/repay()'s forward is still settling, and the
+        arriving amount happens not to push the balance strictly above the
+        stale reservation. fund()/repay() self-heal the reservation on
+        every call already; this exists so a caller can force that
+        true-up explicitly rather than have it only be attempted (and
+        rolled back on failure) inside a fund()/repay() call that reverts
+        for lack of available balance."""
+        return self._reconcile_vault_debt(vault)
+
     # ---------------- supply collateral (vault-attributed) ----------------
     # No shared-address balance-delta race is possible here: this reads the
     # CALLER'S OWN vault. Tokens sitting there were transferred to that
@@ -520,6 +607,13 @@ class LendingProtocol(gl.Contract):
     # caller's, regardless of who calls supply(). Alice's vault never holds
     # Bob's tokens, so Alice's supply() call can never be credited from
     # Bob's transfer.
+    #
+    # Unlike fund()/repay(), supply() never moves tokens OUT of the vault -
+    # collateral simply stays there until withdraw()/liquidate() moves it.
+    # So there is no async gap to protect against here: `already_credited`
+    # (this contract's own collateral_of bookkeeping) can never be pushed
+    # above a FRESH read of the vault's balance, because nothing this
+    # contract does ever makes that balance go down on its own.
     @gl.public.write
     def supply(self, amount: u256) -> u256:
         assert amount > u256(0), "amount must be positive"
@@ -536,21 +630,27 @@ class LendingProtocol(gl.Contract):
         return self.collateral_of[user]
 
     # ---------------- liquidity provisioning (vault-attributed) ----------------
+    # fund() DOES move tokens out of the vault (forwarding them to lending's
+    # own balance), so it goes through the reservation accounting above:
+    # available credit is the vault's balance minus whatever an earlier,
+    # not-yet-landed fund()/repay() call has already reserved.
     @gl.public.write
     def fund(self, amount: u256) -> u256:
         assert amount > u256(0), "amount must be positive"
         user = gl.message.sender_address
         vault = self._ensure_vault(user)
-        vault_balance = gl.get_contract_at(self.debt_token).view().balance_of(vault)
-        assert vault_balance >= amount, (
+        available = self._reconcile_vault_debt(vault)
+        assert available >= amount, (
             "not enough tUSDC in your vault: transfer to your vault address first"
         )
+        self._reserve_vault_debt(vault, amount)
         self.tracked_liquidity = self.tracked_liquidity + amount
         # Move the tokens from the funder's vault into lending's own
         # balance so they are available to lend out. Only the vault owner
         # (via lending as the sole authorized caller) can drain the vault,
-        # so this amount is guaranteed to arrive with no race against
-        # anyone else's transfer.
+        # so this amount is guaranteed to arrive - the reservation above is
+        # what stops a second call from crediting it a second time before
+        # it does.
         Vault(vault).emit().forward(self.debt_token, self.address, amount)
         return self.tracked_liquidity
 
@@ -578,7 +678,11 @@ class LendingProtocol(gl.Contract):
     # ---------------- repay (vault-attributed) ----------------
     # Reads the caller's vault balance to determine what they can repay,
     # then instructs the vault to forward the tokens into lending's own
-    # balance where they replenish protocol liquidity.
+    # balance where they replenish protocol liquidity. Shares the same
+    # per-vault debt-token reservation as fund() (both draw on, and forward
+    # out of, the same vault balance), so a fund() and a repay() racing on
+    # the same still-unsettled vault balance cannot double-credit it
+    # between them either.
     @gl.public.write
     def repay(self, amount: u256) -> u256:
         assert amount > u256(0), "amount must be positive"
@@ -587,10 +691,11 @@ class LendingProtocol(gl.Contract):
         assert debt > u256(0), "no outstanding debt"
         assert amount <= debt, "amount exceeds outstanding debt"
         vault = self._ensure_vault(user)
-        vault_balance = gl.get_contract_at(self.debt_token).view().balance_of(vault)
-        assert vault_balance >= amount, (
+        available = self._reconcile_vault_debt(vault)
+        assert available >= amount, (
             "not enough tUSDC in your vault: transfer to your vault address first"
         )
+        self._reserve_vault_debt(vault, amount)
         self.debt_of[user] = debt - amount
         self.tracked_liquidity = self.tracked_liquidity + amount
         Vault(vault).emit().forward(self.debt_token, self.address, amount)
