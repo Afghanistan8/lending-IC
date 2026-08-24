@@ -2,7 +2,7 @@
 
 A collateralized lending Intelligent Contract for [GenLayer](https://genlayer.com), where the credit limit and liquidation threshold on every position are set by a **live vote of the validator committee**, not a static formula.
 
-- **Contract:** `0x96A553d2d7B677b5F6ec510134D5C5f30E20f2e9` (studionet, chain 61999)
+- **Contract:** `0xEe8f4490C5337EbB4bF22584098E5ee4a6463a93` (studionet, chain 61999)
 - **Constructor args used:** dex `0x9D5D33AF40781B6A41E3865df7B9bEF36adc6005`, pool `0x6A732A632972fC3cF8a76b3CfeE3356C549c761C`, collateral token (tGEN) `0xd978F743Ce2Bad27c00A329F44f8F16b401F556C`, debt token (tUSDC) `0xa04E4F945d941eD491C194E2BD29A4da06c37f07`, `ltv_bps=7500`, `liquidation_bps=8000`
 
 ## What it does
@@ -156,7 +156,7 @@ genlayer deploy --contract contracts/lending.py \
 
 Address arguments must use the `addr#` form. After deploying, call `assess_risk()` at least once — `borrow()` and `liquidate()` are gated on a settled verdict.
 
-Because `assess_risk()` is a genuine live vote, not a formality, it can land as `MAJORITY_DISAGREE` if validators reading the live Fear & Greed feed at slightly different moments (or reasoning about it differently) don't converge — no ruling is applied in that case (`risk_epoch` stays unchanged) and the call should simply be retried. This happened on the deployed instance above: the first `assess_risk()` call disagreed, the second settled `CALM`.
+Because `assess_risk()` is a genuine live vote, not a formality, it can land as `MAJORITY_DISAGREE` if validators reading the live Fear & Greed feed at slightly different moments (or reasoning about it differently) don't converge — no ruling is applied in that case (`risk_epoch` stays unchanged) and the call should simply be retried. This has happened in practice on earlier deployments of this contract; it is expected behavior, not a bug.
 
 `LendingVault` (`contracts/vault.py`) is **not deployed separately** — `LendingProtocol` deploys one per user on demand via `gl.deploy_contract`, embedding the vault's source as `VAULT_CODE`. Keep `contracts/vault.py` and the `VAULT_CODE` literal in `lending.py` in sync if you modify the vault; GenLayer's `CREATE2` address derivation depends on `(deployer, salt, chain_id)` rather than the vault's bytecode hash, so drift between the two won't move addresses, but it will make the deployed vault's actual behavior diverge from what `contracts/vault.py` documents.
 
